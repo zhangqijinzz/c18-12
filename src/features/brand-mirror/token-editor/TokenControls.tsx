@@ -15,6 +15,7 @@ const themes: { id: BrandTheme; label: string; note: string }[] = [
 ]
 
 export function TokenControls({ snapshot, onThemeChange, onColorChange, onScaleChange, onReset }: TokenControlsProps) {
+  const dirty = new Set(snapshot.dirtyFields)
   return (
     <aside className="control-panel">
       <div className="panel-heading">
@@ -24,6 +25,15 @@ export function TokenControls({ snapshot, onThemeChange, onColorChange, onScaleC
         </div>
         <button className="text-button" type="button" onClick={onReset}>恢复默认</button>
       </div>
+
+      {snapshot.dirtyFields.length > 0 && (
+        <div className="dirty-banner">
+          <span className="dirty-dot" />
+          {snapshot.saveStatus === 'error'
+            ? '下列改动写入失败，仅停留在页面，请在顶栏重试'
+            : '标记的改动尚未确认落盘'}
+        </div>
+      )}
 
       <section className="control-section">
         <div className="section-label"><span>基础主题</span><span className="muted">快速起点</span></div>
@@ -39,10 +49,13 @@ export function TokenControls({ snapshot, onThemeChange, onColorChange, onScaleC
       </section>
 
       <section className="control-section">
-        <div className="section-label"><span>品牌色</span><span className="muted">HEX / 6 位</span></div>
+        <div className="section-label">
+          <span>品牌色{dirty.has('primary') || dirty.has('secondary') ? <i className="unsaved-badge">未保存</i> : null}</span>
+          <span className="muted">HEX / 6 位</span>
+        </div>
         <div className="color-fields">
-          <ColorField label="主色" value={snapshot.tokens.primary} onChange={(value) => onColorChange('primary', value)} />
-          <ColorField label="辅助色" value={snapshot.tokens.secondary} onChange={(value) => onColorChange('secondary', value)} />
+          <ColorField label="主色" dirty={dirty.has('primary')} value={snapshot.tokens.primary} onChange={(value) => onColorChange('primary', value)} />
+          <ColorField label="辅助色" dirty={dirty.has('secondary')} value={snapshot.tokens.secondary} onChange={(value) => onColorChange('secondary', value)} />
         </div>
         <div className={`contrast-note ${snapshot.contrastWarning ? 'warning' : ''}`}>
           <span className="contrast-icon">◐</span>
@@ -50,19 +63,37 @@ export function TokenControls({ snapshot, onThemeChange, onColorChange, onScaleC
         </div>
       </section>
 
-      <ScaleControl label="圆角尺度" hint="px" values={snapshot.tokens.radiusScale} field="radiusScale" onChange={onScaleChange} />
-      <ScaleControl label="间距体系" hint="px" values={snapshot.tokens.spacingScale} field="spacingScale" onChange={onScaleChange} />
-      <ScaleControl label="字体比例" hint="px" values={snapshot.tokens.typeScale} field="typeScale" onChange={onScaleChange} />
+      <ScaleControl label="圆角尺度" hint="px" field="radiusScale" dirty={dirty.has('radiusScale')} snapshot={snapshot} onChange={onScaleChange} />
+      <ScaleControl label="间距体系" hint="px" field="spacingScale" dirty={dirty.has('spacingScale')} snapshot={snapshot} onChange={onScaleChange} />
+      <ScaleControl label="字体比例" hint="px" field="typeScale" dirty={dirty.has('typeScale')} snapshot={snapshot} onChange={onScaleChange} />
 
-      <div className="panel-footer"><span className="live-dot" />所有调整实时同步到预览</div>
+      <div className="panel-footer"><span className="live-dot" />所有调整实时同步到预览{dirty.size > 0 ? <em className="footer-unsaved">· {dirty.size} 组未落盘</em> : null}</div>
     </aside>
   )
 }
 
-function ColorField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
-  return <label className="color-field"><span>{label}</span><div className="color-input"><input aria-label={label} type="color" value={value} onChange={(event) => onChange(event.target.value)} /><input aria-label={`${label} HEX`} value={value} onChange={(event) => onChange(event.target.value)} /></div></label>
+function ColorField({ label, value, dirty, onChange }: { label: string; value: string; dirty: boolean; onChange: (value: string) => void }) {
+  return (
+    <label className={`color-field ${dirty ? 'is-dirty' : ''}`}>
+      <span>{label}{dirty && <i className="unsaved-dot" title="该改动尚未落盘" />}</span>
+      <div className="color-input"><input aria-label={label} type="color" value={value} onChange={(event) => onChange(event.target.value)} /><input aria-label={`${label} HEX`} value={value} onChange={(event) => onChange(event.target.value)} /></div>
+    </label>
+  )
 }
 
-function ScaleControl({ label, hint, values, field, onChange }: { label: string; hint: string; values: number[]; field: 'radiusScale' | 'spacingScale' | 'typeScale'; onChange: (field: 'radiusScale' | 'spacingScale' | 'typeScale', index: number, value: number) => void }) {
-  return <section className="control-section scale-section"><div className="section-label"><span>{label}</span><span className="muted">{hint}</span></div><div className="scale-inputs">{values.map((value, index) => <label key={`${field}-${index}`}><span>{index + 1}</span><input aria-label={`${label}${index + 1}`} type="number" min={field === 'typeScale' ? 10 : 0} max={field === 'typeScale' ? 72 : field === 'spacingScale' ? 64 : 40} value={value} onChange={(event) => onChange(field, index, Number(event.target.value))} /></label>)}</div></section>
+function ScaleControl({ label, hint, field, dirty, snapshot, onChange }: { label: string; hint: string; field: 'radiusScale' | 'spacingScale' | 'typeScale'; dirty: boolean; snapshot: BrandMirrorSnapshot; onChange: (field: 'radiusScale' | 'spacingScale' | 'typeScale', index: number, value: number) => void }) {
+  const values = snapshot.tokens[field]
+  const persistedValues = snapshot.persistedTokens?.[field]
+  return (
+    <section className="control-section scale-section">
+      <div className="section-label">
+        <span>{label}{dirty && <i className="unsaved-badge">未保存</i>}</span>
+        <span className="muted">{hint}</span>
+      </div>
+      <div className="scale-inputs">{values.map((value, index) => {
+        const itemDirty = !persistedValues || persistedValues[index] !== value
+        return <label className={itemDirty ? 'is-dirty' : ''} key={`${field}-${index}`}><span>{index + 1}{itemDirty && <i className="unsaved-dot" />}</span><input aria-label={`${label}${index + 1}`} type="number" min={field === 'typeScale' ? 10 : 0} max={field === 'typeScale' ? 72 : field === 'spacingScale' ? 64 : 40} value={value} onChange={(event) => onChange(field, index, Number(event.target.value))} /></label>
+      })}</div>
+    </section>
+  )
 }
