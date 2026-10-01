@@ -1,12 +1,25 @@
-import { clampTokenValues, cloneTokens, contrastRatio, normalizeColor, themeTokens, validateTokens } from '../domain/brandRules'
+import { clampTokenValues, cloneTokens, contrastRatio, diffDirty, hasDirtyFlags, normalizeColor, themeTokens, validateTokens } from '../domain/brandRules'
 import type { BrandRepository } from '../repositories/brandRepository'
 import type { BrandGuidelinesExporter } from '../services/exportService'
-import { INITIAL_TOKENS, type BrandDocument, type BrandMirrorSnapshot, type BrandTheme, type SavedVersion } from '../models/brandMirrorModels'
+import { INITIAL_TOKENS, type BrandDocument, type BrandMirrorSnapshot, type BrandTheme, type DirtyFlags, type SavedVersion } from '../models/brandMirrorModels'
 
 type Listener = () => void
 
+const SAVE_FAILURE_MESSAGE = '本地写入失败，改动仅保留在页面中，尚未落盘'
+
 export class BrandMirrorViewModel {
-  private snapshot: BrandMirrorSnapshot = this.makeSnapshot({ tokens: INITIAL_TOKENS, theme: 'studio', versions: [] })
+  /** 页面上的工作区内容（可能领先于已落盘内容） */
+  private working: Omit<BrandDocument, 'version'> = { tokens: cloneTokens(INITIAL_TOKENS), theme: 'studio', versions: [] }
+  /** 最后一次确认写入成功的内容基线 */
+  private persisted: Omit<BrandDocument, 'version'> = { tokens: cloneTokens(INITIAL_TOKENS), theme: 'studio', versions: [] }
+  /** 粘性写入失败：只有一次重试真正写入成功后才会清除 */
+  private saveError: string | null = null
+  /** 是否曾经确认写入成功（或从本地恢复过文档）；此前不得声称“已保存” */
+  private everPersisted = false
+  private lastSavedAt: string | null = null
+  private message = ''
+  private compareMode = false
+  private snapshot: BrandMirrorSnapshot = this.buildSnapshot()
   private readonly listeners = new Set<Listener>()
   private readonly repository: BrandRepository
   private readonly exporter?: BrandGuidelinesExporter
@@ -28,97 +41,157 @@ export class BrandMirrorViewModel {
   initialize(): void {
     const stored = this.repository.load()
     if (stored) {
-      this.snapshot = this.makeSnapshot(stored, '已恢复最近一次工作状态')
+      const restored = { tokens: clampTokenValues(stored.tokens), theme: stored.theme, versions: stored.versions }
+      this.working = cloneDocument(restored)
+      this.persisted = cloneDocument(restored)
+      this.saveError = null
+      this.everPersisted = true
+      this.lastSavedAt = null
+      this.message = '已恢复最近一次工作状态'
     } else {
-      this.snapshot = this.makeSnapshot({ tokens: INITIAL_TOKENS, theme: 'studio', versions: [] }, '从 Studio warm 开始探索')
+      this.working = { tokens: cloneTokens(INITIAL_TOKENS), theme: 'studio', versions: [] }
+      this.persisted = cloneDocument(this.working)
+      this.message = '从 Studio warm 开始探索'
     }
-    this.emit()
+    this.refresh()
   }
 
   selectTheme(theme: BrandTheme): void {
-    this.update({ tokens: themeTokens(theme), theme }, '已切换基础主题')
+    this.working = { ...this.working, tokens: themeTokens(theme), theme }
+    this.message = '令牌已更新'
+    this.attemptWrite()
   }
 
   updateColor(field: 'primary' | 'secondary', value: string): void {
     const color = normalizeColor(value)
-    this.update({ tokens: { ...this.snapshot.tokens, [field]: color } }, '令牌已更新')
+    this.working = { ...this.working, tokens: { ...this.working.tokens, [field]: color } }
+    this.message = '令牌已更新'
+    this.attemptWrite()
   }
 
   updateScale(field: 'radiusScale' | 'spacingScale' | 'typeScale', index: number, value: number): void {
-    const values = [...this.snapshot.tokens[field]]
+    const values = [...this.working.tokens[field]]
     values[index] = Number.isFinite(value) ? value : values[index]
-    this.update({ tokens: clampTokenValues({ ...this.snapshot.tokens, [field]: values }) }, '令牌已更新')
+    this.working = { ...this.working, tokens: clampTokenValues({ ...this.working.tokens, [field]: values }) }
+    this.message = '令牌已更新'
+    this.attemptWrite()
   }
 
   reset(): void {
-    this.update({ tokens: cloneTokens(INITIAL_TOKENS), theme: 'studio' }, '已恢复默认令牌')
+    this.working = { ...this.working, tokens: cloneTokens(INITIAL_TOKENS), theme: 'studio' }
+    this.message = '已恢复默认令牌'
+    this.attemptWrite()
   }
 
   saveVersion(): void {
-    const validationError = validateTokens(this.snapshot.tokens)
+    const validationError = validateTokens(this.working.tokens)
     if (validationError) {
-      this.snapshot = { ...this.snapshot, status: 'error', message: validationError }
-      this.emit()
+      // 校验未通过不是写入失败：不改动持久化状态，只提示用户
+      this.message = validationError
+      this.refresh()
       return
     }
+    // 标签以已落盘版本数为准：失败重试不会产生重名版本
+    const versionOrdinal = this.persisted.versions.length
     const nextVersion: SavedVersion = {
       id: `version-${Date.now()}`,
-      label: this.snapshot.versions.length === 0 ? 'Version A' : `Version ${String.fromCharCode(65 + this.snapshot.versions.length)}`,
-      tokens: cloneTokens(this.snapshot.tokens),
+      label: versionOrdinal === 0 ? 'Version A' : `Version ${String.fromCharCode(65 + versionOrdinal)}`,
+      tokens: cloneTokens(this.working.tokens),
       createdAt: new Date().toISOString(),
     }
-    const versions = [...this.snapshot.versions, nextVersion]
-    this.persist({ tokens: this.snapshot.tokens, theme: this.snapshot.theme, versions }, '版本已保存')
+    this.working = { ...this.working, versions: [...this.working.versions, nextVersion] }
+    this.message = ''
+    this.attemptWrite('版本已保存')
+  }
+
+  /** 用户显式重试：把当前页面内容再次尝试写入本地，成功后才恢复“已保存”表示 */
+  retrySave(): void {
+    if (!this.saveError) return
+    this.attemptWrite('重试成功，改动已写入本地')
   }
 
   toggleCompare(): void {
-    this.snapshot = { ...this.snapshot, compareMode: !this.snapshot.compareMode, message: this.snapshot.compareMode ? '已退出对比模式' : '正在对比最近两个版本' }
-    this.emit()
+    this.compareMode = !this.compareMode
+    this.message = this.compareMode ? '正在对比最近两个版本' : '已退出对比模式'
+    this.refresh()
   }
 
   exportBrandGuidelines(): void {
     if (!this.exporter) return
     try {
       this.exporter.export(this.snapshot)
-      this.snapshot = { ...this.snapshot, message: '品牌规范已导出' }
+      this.message = '品牌规范已导出'
     } catch {
-      this.snapshot = { ...this.snapshot, status: 'error', message: '导出失败，请稍后重试' }
+      this.message = '导出失败，请稍后重试'
     }
-    this.emit()
+    this.refresh()
   }
 
-  private update(partial: Partial<Pick<BrandDocument, 'tokens' | 'theme'>>, message: string): void {
-    const tokens = partial.tokens ?? this.snapshot.tokens
-    this.snapshot = this.makeSnapshot({ tokens, theme: partial.theme ?? this.snapshot.theme, versions: this.snapshot.versions }, message, 'editing')
-    this.persistCurrent()
-  }
-
-  private persistCurrent(): void {
+  /**
+   * 唯一的写入出口：根据真实写入结果推进状态。
+   * 成功 → 更新落盘基线、清除失败；失败 → 保留页面改动并让失败持续可见。
+   * 编辑过程中也会自动再试一次，但失败绝不会被新的编辑动作静默掩盖。
+   */
+  private attemptWrite(successMessage?: string): void {
     try {
-      this.repository.save({ version: 1, tokens: this.snapshot.tokens, theme: this.snapshot.theme, versions: this.snapshot.versions })
-    } catch {
-      this.snapshot = { ...this.snapshot, status: 'error', message: '本地保存失败，但当前编辑仍保留在页面中' }
+      this.repository.save(toDocument(this.working))
+      this.persisted = cloneDocument(this.working)
+      this.saveError = null
+      this.everPersisted = true
+      this.lastSavedAt = new Date().toISOString()
+      if (successMessage) this.message = successMessage
+    } catch (error) {
+      this.saveError = error instanceof Error && error.message ? error.message : SAVE_FAILURE_MESSAGE
     }
-    this.emit()
+    this.refresh()
   }
 
-  private persist(document: Omit<BrandDocument, 'version'>, message: string): void {
-    try {
-      this.repository.save({ version: 1, ...document })
-      this.snapshot = this.makeSnapshot(document, message, 'ready')
-    } catch {
-      this.snapshot = { ...this.snapshot, status: 'error', message: '版本保存失败，请稍后重试' }
-    }
-    this.emit()
+  private computeDirty(): DirtyFlags {
+    const tokens = diffDirty(this.working, this.persisted)
+    const persistedIds = this.persisted.versions.map((version) => version.id)
+    const workingIds = this.working.versions.map((version) => version.id)
+    const versions = workingIds.length !== persistedIds.length || workingIds.some((id, index) => id !== persistedIds[index])
+    return { ...tokens, versions }
   }
 
-  private makeSnapshot(document: Omit<BrandDocument, 'version'>, message = '', status: BrandMirrorSnapshot['status'] = 'ready'): BrandMirrorSnapshot {
-    const ratio = contrastRatio(document.tokens.primary, document.tokens.secondary)
-    const latestVersion = document.versions[document.versions.length - 1]
-    return { status, tokens: cloneTokens(document.tokens), theme: document.theme, versions: document.versions, compareMode: false, activeVersionId: latestVersion?.id ?? null, contrastRatio: ratio, contrastWarning: ratio < 3, message }
+  private buildSnapshot(): BrandMirrorSnapshot {
+    const dirty = this.computeDirty()
+    const hasUnsavedChanges = hasDirtyFlags(dirty)
+    const status: BrandMirrorSnapshot['status'] = this.saveError ? 'error' : !this.everPersisted || hasUnsavedChanges ? 'unsaved' : 'saved'
+    const tokens = cloneTokens(this.working.tokens)
+    const latestVersion = this.working.versions[this.working.versions.length - 1]
+    const ratio = contrastRatio(tokens.primary, tokens.secondary)
+    return {
+      status,
+      tokens,
+      theme: this.working.theme,
+      versions: [...this.working.versions],
+      compareMode: this.compareMode,
+      activeVersionId: latestVersion?.id ?? null,
+      contrastRatio: ratio,
+      contrastWarning: ratio < 3,
+      dirty,
+      hasUnsavedChanges,
+      saveError: this.saveError,
+      lastSavedAt: this.lastSavedAt,
+      message: this.saveError ? SAVE_FAILURE_MESSAGE : this.message,
+    }
+  }
+
+  private refresh(): void {
+    this.snapshot = this.buildSnapshot()
+    this.emit()
   }
 
   private emit(): void {
     this.listeners.forEach((listener) => listener())
   }
+}
+
+function cloneDocument(document: Omit<BrandDocument, 'version'>): Omit<BrandDocument, 'version'> {
+  return { tokens: cloneTokens(document.tokens), theme: document.theme, versions: document.versions.map((version) => ({ ...version, tokens: cloneTokens(version.tokens) })) }
+}
+
+function toDocument(document: Omit<BrandDocument, 'version'>): BrandDocument {
+  return { version: 1, ...cloneDocument(document) }
 }

@@ -1,4 +1,4 @@
-import type { BrandTheme, BrandTokens } from '../models/brandMirrorModels'
+import type { BrandTheme, BrandTokens, DirtyFlags } from '../models/brandMirrorModels'
 import { INITIAL_TOKENS, THEME_PRESETS } from '../models/brandMirrorModels'
 
 const HEX_COLOR = /^#[0-9A-F]{6}$/i
@@ -52,4 +52,27 @@ export function contrastRatio(first: string, second: string): number {
 
 export function themeTokens(theme: BrandTheme): BrandTokens {
   return cloneTokens(THEME_PRESETS[theme].tokens)
+}
+
+function sameScale(left: number[], right: number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+/**
+ * 逐组比对工作区内容与最后一次成功写入的基线，
+ * 让用户可以分辨哪些改动已经落盘、哪些还只停留在页面上。
+ */
+export function diffDirty(working: { tokens: BrandTokens; theme: BrandTheme }, persisted: { tokens: BrandTokens; theme: BrandTheme }): Omit<DirtyFlags, 'versions'> {
+  return {
+    theme: working.theme !== persisted.theme,
+    primary: working.tokens.primary !== persisted.tokens.primary,
+    secondary: working.tokens.secondary !== persisted.tokens.secondary,
+    radiusScale: !sameScale(working.tokens.radiusScale, persisted.tokens.radiusScale),
+    spacingScale: !sameScale(working.tokens.spacingScale, persisted.tokens.spacingScale),
+    typeScale: !sameScale(working.tokens.typeScale, persisted.tokens.typeScale),
+  }
+}
+
+export function hasDirtyFlags(dirty: DirtyFlags): boolean {
+  return Object.values(dirty).some(Boolean)
 }
